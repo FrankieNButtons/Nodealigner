@@ -122,12 +122,12 @@ fn combine_main(matches: &clap::ArgMatches) -> Result<(), Box<dyn std::error::Er
         .unwrap_or_default();
 
     println!("[info] Reading TSV and building node-to-path map...");
-    let mut node2path = io_utils::read_tsv_node_path(tsv_path)?;
+    let mut node2path = io_stream::read_tsv_node_path(tsv_path)?;
     // 这里会自动打印debug: node2path contains key 1? true/false
 
     if let Some(ref_path) = reference_path {
         println!("[info] Reading reference.tsv: {ref_path}");
-        let ref_map = io_utils::read_reference_tsv(ref_path)?;
+        let ref_map = io_stream::read_reference_tsv(ref_path)?;
         let mut count = 0;
         for (node, path) in ref_map {
             if !node2path.contains_key(&node) {
@@ -141,7 +141,7 @@ fn combine_main(matches: &clap::ArgMatches) -> Result<(), Box<dyn std::error::Er
     // --- Streaming pass to temp file ---
     let tmp_out = format!("{output_path}.tmp");
     println!("[info] Streaming CHROM replacement & CHROM-skip to temp: {}", tmp_out);
-    let stats = io_utils::stream_replace_chrom_to_tmp(
+    let stats = io_stream::stream_replace_chrom_to_tmp(
         vcf_path,
         &tmp_out,
         &node2path,
