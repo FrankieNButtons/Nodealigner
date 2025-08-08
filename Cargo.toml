@@ -1,9 +1,9 @@
 [package]
 name = "gfa2bin-aligner"
-version = "0.0.1"
+version = "0.0.2"
 edition = "2024"
 
 [dependencies]
-clap = "4.5.42"
+clap = "4.5.43"
 rayon = "1.10.0"
 gfa-reader = {git = "https://github.com/MoinSebi/gfa-reader"}
