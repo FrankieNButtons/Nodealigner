@@ -103,9 +103,11 @@ pub fn header_run(
     }
 
     for (k, ks) in inferred_info {
-        if k == "GT" { continue; } // never create INFO/GT; GT belongs to FORMAT
+        // Always add INFO fields present in the data, even GT (which will be ignored by downstream tools if present in INFO).
         if !existing_info.contains(&k) {
-            new_header.push(infer_info_def(&k, &ks));
+            // If no type/description can be inferred, allow empty description.
+            // Use a flag to indicate that empty description is allowed.
+            new_header.push(infer_info_def_with_empty(&k, &ks, true));
         }
     }
     for (k, (kind, card)) in inferred_fmt {
@@ -208,7 +210,7 @@ fn classify_value_token(tok: &str) -> ValKind {
     ValKind::Stringy
 }
 
-fn infer_info_def(id: &str, ks: &KeyStats) -> String {
+fn infer_info_def_with_empty(id: &str, ks: &KeyStats, allow_empty: bool) -> String {
     // Type
     let typ = if ks.seen_as_flag {
         "Flag".to_string()
@@ -233,7 +235,20 @@ fn infer_info_def(id: &str, ks: &KeyStats) -> String {
         ".".to_string()
     };
 
-    format!("##INFO=<ID={id},Number={number},Type={typ},Description=\"Inferred from body\">")
+    // Description
+    let desc = if allow_empty && ks.samples == 0 {
+        ""
+    } else if allow_empty && typ == "" {
+        ""
+    } else {
+        "Inferred from body"
+    };
+    // If allow_empty and desc is empty, emit empty Description
+    if allow_empty && desc.is_empty() {
+        format!("##INFO=<ID={id},Number={number},Type={typ},Description=\"\">")
+    } else {
+        format!("##INFO=<ID={id},Number={number},Type={typ},Description=\"{desc}\">")
+    }
 }
 
 fn infer_format_def(id: &str, example_kind: Option<ValKind>, example_card: Option<usize>) -> String {
