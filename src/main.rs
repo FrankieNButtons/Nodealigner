@@ -1,6 +1,7 @@
 mod extract;
 mod io_stream;
 mod sort_main;
+mod header;
 
 use clap::{Arg, Command};
 use std::collections::HashSet;
@@ -10,14 +11,14 @@ use std::io::{BufRead, Write};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app = Command::new("gfa2bin-aligner")
-        .version("0.2.0")
-        .about("Graph VCF toolkit: combine and extract modes")
+        .version("0.0.3")
+        .about("Graph VCF toolkit extends from `gfa2bin`: align and extract modes")
         .subcommand(
-            Command::new("combine")
-                .about("Combine VCF with alignment TSV, replacing #CHROM by path, with filter/sort/threads. Optionally use reference.tsv as fallback.")
+            Command::new("align")
+                .about("Align VCF with alignment TSV, replacing #CHROM by path, with filter/sort/threads. Optionally use reference.tsv as fallback.")
                 .arg(Arg::new("vcf").short('v').long("vcf").help("Input VCF file").required(true))
                 .arg(Arg::new("alignment").short('a').long("alignment").help("TSV file (alignment)").required(true))
-                .arg(Arg::new("reference").short('r').long("reference").help("Optional reference.tsv for extra #CHROM mapping (produced by extract)").num_args(1))
+                .arg(Arg::new("reference").short('r').long("reference").help("reference.tsv for CHROM mapping/header synthesis; required unless --no-header").num_args(1).required_unless_present("no-header"))
                 .arg(Arg::new("skip").short('s').long("skip").help("Comma-separated substrings. A record is dropped if its raw #CHROM contains any of them.").num_args(1))
                 .arg(Arg::new("ignore").long("ignore").help("Ignore/normalize CHROM level [0-5] (applied after --skip): 0=keep, 1=has 'chr', 2=token [0-9XYM], 3=no suffix, 4=only chr{1..22,X,Y,M}, 5=only {1..22,X,Y,M}").num_args(1).default_value("4"))
                 .arg(Arg::new("output").short('o').long("output").help("Output VCF file path (default: <input>.replaced.vcf)"))
@@ -25,6 +26,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .arg(Arg::new("prefix").short('p').long("prefix").help("Column to sort by: keyword (CHROM, POS, ID, REF, ALT, QUAL, FILTER, INFO, FORMAT) or 0-based index").default_value("POS"))
                 .arg(Arg::new("reverse").long("reverse").help("Sort descending (big to small)").action(clap::ArgAction::SetTrue))
                 .arg(Arg::new("threads").short('T').long("threads").help("Number of threads for Rayon").num_args(1))
+                .arg(Arg::new("no-header").long("no-header").help("Do not synthesize a header on the combined VCF (by default, header is added using reference.tsv)").action(clap::ArgAction::SetTrue))
         )
         .subcommand(
             Command::new("extract")
@@ -32,6 +34,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .arg(Arg::new("gfa").short('g').long("gfa").help("Input GFA file").required(true))
                 .arg(Arg::new("output").short('o').long("output").help("Output TSV file (4 columns: node, start, end, path)").default_value("./reference.tsv"))
                 .arg(Arg::new("threads").short('T').long("threads").help("Number of threads for parsing GFA").num_args(1))
+        )
+        .subcommand(
+            Command::new("header")
+                .about("Synthesize a valid VCF header using reference.tsv and keys inferred from the VCF body; writes a new VCF with merged header")
+                .arg(Arg::new("vcf").short('v').long("vcf").help("Input VCF/VCF-like file (plain text)").required(true))
+                .arg(Arg::new("reference").short('r').long("reference").help("reference.tsv produced by 'extract' (columns: node, start, end, path)").required(true))
+                .arg(Arg::new("output").short('o').long("output").help("Output VCF path (default: <input>.withheader.vcf)"))
+                .arg(Arg::new("threads").short('T').long("threads").help("Number of threads for Rayon").num_args(1))
+                .arg(
+                    Arg::new("ignore")
+                        .long("ignore")
+                        .help("Ignore/normalize CHROM level [0-5] (applied after --skip): 0=keep, 1=has 'chr', 2=token [0-9XYM], 3=no suffix, 4=only chr{1..22,X,Y,M}, 5=only {1..22,X,Y,M}")
+                        .num_args(1)
+                        .default_value("4")
+                )
         )
         .subcommand(
             Command::new("sort")
@@ -45,6 +62,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     match matches.subcommand() {
         Some(("combine", sub_m)) => combine_main(sub_m),
         Some(("extract", sub_m)) => extract::extract_main(sub_m),
+        Some(("header", sub_m)) => header::header_main(sub_m),
         Some(("sort", sub_m)) => sort_main::sort_main(sub_m),
         _ => {
             println!("Please choose a subcommand: combine or extract. Use --help for details.");
@@ -94,6 +112,7 @@ fn combine_main(matches: &clap::ArgMatches) -> Result<(), Box<dyn std::error::Er
     let threads = matches.get_one::<String>("threads").unwrap_or(&String::new()).clone();
     let prefix_key = matches.get_one::<String>("prefix").map(|s| s.to_string()).unwrap_or_else(|| "POS".to_string());
     let reverse = matches.get_flag("reverse");
+    let no_header = matches.get_flag("no-header");
 
     let reference_path = matches.get_one::<String>("reference").map(|s| s.as_str());
 
@@ -108,6 +127,7 @@ fn combine_main(matches: &clap::ArgMatches) -> Result<(), Box<dyn std::error::Er
     println!("    --threads  : {threads}");
     println!("    --prefix   : {prefix_key}");
     println!("    --reverse  : {reverse}");
+    println!("    --no-header: {}", no_header);
     println!("    #CHROM field will always be replaced by the corresponding path from TSV, or reference.tsv as fallback if provided.");
 
     let num_threads: Option<usize> = matches.get_one::<String>("threads")
@@ -203,6 +223,19 @@ fn combine_main(matches: &clap::ArgMatches) -> Result<(), Box<dyn std::error::Er
         let _ = fs::remove_file(&tmp_out);
     } else {
         fs::rename(&tmp_out, &output_path)?;
+    }
+
+    // Decide which file we produced
+    let combined_out = if sort_enabled { final_output_path.clone() } else { output_path.clone() };
+
+    if !no_header {
+        // Reference is required unless --no-header per CLI; unwrap is safe here
+        let ref_path = matches.get_one::<String>("reference").expect("reference.tsv required unless --no-header");
+        let threads_opt: Option<usize> = matches.get_one::<String>("threads").and_then(|s| s.parse().ok());
+        println!("[info] Auto-running 'header' on combined output: {}", combined_out);
+        let _hdr_out = header::header_run(&combined_out, ref_path, threads_opt, None, ignore_level)?;
+    } else {
+        println!("[info] --no-header set: skipping automatic header synthesis");
     }
 
     println!("[info] All operations complete. Output written to {output_path}.");
