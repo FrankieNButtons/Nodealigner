@@ -247,8 +247,10 @@ fn apply_ignore_rules(raw: &str, level: u8) -> Option<String> {
 
 /// Stream the input VCF and write a transformed, unsorted temp VCF.
 /// - Drop any record whose **raw CHROM** contains a `--skip` token (substring)
-/// - For remaining records, if CHROM parses to a node id and exists in `node2path`,
-///   replace CHROM with the mapped path. Otherwise keep CHROM as-is and count as `unmapped`.
+/// - For remaining records, if CHROM parses to a node id and exists in mappings:
+///     - **Path** comes from `alignment.tsv` (`node2path` arg) with priority; if missing there, fall back to `reference.tsv` (global OnceLocks).
+///     - **Start/Seq** always come from `reference.tsv` (global OnceLocks).
+///   Otherwise keep CHROM as-is and count as `unmapped`.
 /// - Headers are passed through unchanged.
 ///
 /// NOTE: Sorting is not performed here. The caller may run an external sort on the
@@ -301,13 +303,16 @@ pub fn stream_replace_chrom_to_tmp(
         let mut wrote = false;
 
         if let Some(node_id) = node_id_opt {
-            // 从 reference.tsv 获取 path/start/seq
+            // 路径优先来自 alignment.tsv，其次才使用 reference.tsv；start/seq 始终来自 reference.tsv
             let path_from_ref = REF_NODE2PATH.get().and_then(|m| m.get(&node_id));
             let start_from_ref = REF_NODE2START.get().and_then(|m| m.get(&node_id)).copied();
             let seq_from_ref = REF_NODE2SEQ.get().and_then(|m| m.get(&node_id));
+            let path_from_aln = node2path.get(&node_id);
 
-            let chosen_path = path_from_ref.or_else(|| node2path.get(&node_id));
-            let from_ref = path_from_ref.is_some();
+            // alignment.tsv 优先；若缺失则回退到 reference.tsv
+            let chosen_path = path_from_aln.or(path_from_ref);
+            let from_aln = path_from_aln.is_some();
+            let from_ref = !from_aln && path_from_ref.is_some();
 
             if let Some(path_val) = chosen_path {
                 if let Some(norm_chr) = apply_ignore_rules(path_val, ignore_level) {
@@ -356,10 +361,10 @@ pub fn stream_replace_chrom_to_tmp(
                         stats.missing_start += 1;
                     }
 
-                    if from_ref {
-                        stats.used_ref_map += 1;
-                    } else {
+                    if from_aln {
                         stats.used_aln_map += 1;
+                    } else if from_ref {
+                        stats.used_ref_map += 1;
                     }
 
                     writeln!(writer, "{}", out_fields.join("\t"))?;

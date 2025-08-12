@@ -30,10 +30,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .subcommand(
             Command::new("extract")
-                .about("Extract all paths from a GFA into TSV (4 or 6 columns): node, start, end, [seq, length,] path")
+                .about("Extract all paths (P & converted W) from a GFA into TSV (4 or 6 columns): node, start, end, [seq, length,] path. Supports --ignore to filter/normalize path names. Default output: <dir_of_gfa>/reference.tsv")
                 .arg(Arg::new("gfa").short('g').long("gfa").help("Input GFA file").required(true))
-                .arg(Arg::new("output").short('o').long("output").help("Output TSV file (4 or 6 columns). Last column is path.").default_value("./reference.tsv"))
+                .arg(Arg::new("output").short('o').long("output").help("Output TSV file (4 or 6 columns). Last column is path. Default: <dir_of_gfa>/reference.tsv") )
                 .arg(Arg::new("threads").short('T').long("threads").help("Number of threads for parsing GFA").num_args(1))
+                .arg(
+                    Arg::new("ignore")
+                        .long("ignore")
+                        .help("Ignore/normalize CHROM level [0-5] applied to path names: 0=keep, 1=has 'chr', 2=token [0-9XYM], 3=no suffix, 4=only chr{1..22,X,Y,M}, 5=only {1..22,X,Y,M}")
+                        .num_args(1)
+                        .default_value("4")
+                )
         )
         .subcommand(
             Command::new("header")
@@ -211,10 +218,7 @@ fn align_main(matches: &clap::ArgMatches) -> Result<(), Box<dyn std::error::Erro
         let ref_map = io_stream::read_reference_tsv(ref_path)?; // also seeds REF_NODE2* caches
         let ref_count = ref_map.len();
         node2path = ref_map;
-        println!(
-            "[info] reference.tsv loaded: {} node-paths",
-            ref_count
-        );
+        println!("[info] reference.tsv loaded: {} node-paths", ref_count);
     } else {
         println!("[info] No reference.tsv provided; will rely on alignment TSV for path mapping");
     }
