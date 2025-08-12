@@ -13,22 +13,29 @@ pub fn header_run(
         println!("[info] Rayon thread pool set to {n} threads");
     }
 
-    // Output path default: ./<basename-without-.vcf>.withheader.vcf (also handle .vcf.gz)
+    // Output path default: <same-dir>/<basename-without-.vcf>.withheader.vcf (handle .vcf.gz)
     let out_path = if let Some(o) = output {
         o.to_string()
     } else {
-        let fname = std::path::Path::new(vcf_in)
+        let in_path = std::path::Path::new(vcf_in);
+        let parent = in_path.parent().unwrap_or(std::path::Path::new("."));
+        let fname = in_path
             .file_name()
             .and_then(|s| s.to_str())
             .unwrap_or("output");
+
         let stem = if fname.ends_with(".vcf.gz") {
-            fname.trim_end_matches(".vcf.gz")
+            &fname[..fname.len() - ".vcf.gz".len()]
         } else if fname.ends_with(".vcf") {
-            fname.trim_end_matches(".vcf")
+            &fname[..fname.len() - ".vcf".len()]
         } else {
             fname
         };
-        format!("./{}.withheader.vcf", stem)
+
+        parent
+            .join(format!("{}.headed.vcf", stem))
+            .to_string_lossy()
+            .into_owned()
     };
 
     println!("[info] [header] --vcf {vcf_in}");
@@ -103,7 +110,7 @@ pub fn header_run(
             }
         }
     }
-    for (id, len) in norm_map {
+    for (id, len) in norm_map.into_iter() {
         if len > 0 {
             new_header.push(format!("##contig=<ID={},length={}>", id, len));
         } else {
@@ -174,31 +181,113 @@ use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::path::Path;
 
 type Contigs = BTreeMap<String, u64>;
-
 fn parse_reference_tsv(p: &str) -> io::Result<Contigs> {
     let f = BufReader::new(File::open(p)?);
     let mut contigs: Contigs = BTreeMap::new();
+
+    // Heuristics supported:
+    // 1) Header like: node,start,end,path  (tab or comma)
+    // 2) Header like: path,length OR chrom,length
+    // 3) No header: assume at least 4 columns and take 4th as path, 3rd as end
+    // We aggregate by path and keep the maximum length/end.
+
+    let mut header_cols: Option<Vec<String>> = None;
+
     for (i, line) in f.lines().enumerate() {
-        let l = line?;
-        if l.trim().is_empty() {
+        let l_raw = line?;
+        let l = l_raw.trim();
+        if l.is_empty() {
             continue;
         }
-        if i == 0 && l.starts_with("node\tstart\tend\tpath") {
-            continue;
+
+        // Prefer TAB; fall back to comma
+        let parts_tab: Vec<&str> = l.split('\t').collect();
+        let parts: Vec<&str> = if parts_tab.len() > 1 {
+            parts_tab
+        } else {
+            l.split(',').collect()
+        };
+
+        if i == 0 {
+            // Detect header if any field has letters
+            let looks_like_header = parts
+                .iter()
+                .any(|c| c.chars().any(|ch| ch.is_ascii_alphabetic()));
+            if looks_like_header {
+                header_cols = Some(parts.iter().map(|s| s.to_ascii_lowercase()).collect());
+                continue; // data starts from next line
+            }
         }
-        let mut it = l.split('\t');
-        let _node = it.next().unwrap_or_default();
-        let _start = it.next().unwrap_or_default();
-        let end = it.next().unwrap_or("0").parse::<u64>().unwrap_or(0);
-        let path = it.next().unwrap_or("").to_string();
-        if path.is_empty() {
-            continue;
-        }
+
+        let (path_opt, len_opt) = if let Some(cols) = &header_cols {
+            // Map likely columns by name
+            let mut path_idx: Option<usize> = None;
+            let mut len_idx: Option<usize> = None;
+            let mut end_idx: Option<usize> = None;
+            let mut start_idx: Option<usize> = None;
+
+            for (idx, name) in cols.iter().enumerate() {
+                if path_idx.is_none()
+                    && (name.contains("path") || name == "chrom" || name.contains("chr"))
+                {
+                    path_idx = Some(idx);
+                }
+                if len_idx.is_none() && (name == "length" || name == "len") {
+                    len_idx = Some(idx);
+                }
+                if end_idx.is_none() && name == "end" {
+                    end_idx = Some(idx);
+                }
+                if start_idx.is_none() && (name == "start" || name == "beg") {
+                    start_idx = Some(idx);
+                }
+            }
+
+            let path_val = path_idx.and_then(|pi| parts.get(pi)).map(|s| s.to_string());
+            let len_val = if let Some(li) = len_idx {
+                parts.get(li).and_then(|s| s.parse::<u64>().ok())
+            } else if let Some(ei) = end_idx {
+                parts.get(ei).and_then(|s| s.parse::<u64>().ok())
+            } else if let (Some(_si), Some(ei)) = (start_idx, end_idx) {
+                parts.get(ei).and_then(|s| s.parse::<u64>().ok())
+            } else {
+                // last numeric-looking column
+                parts.last().and_then(|s| s.parse::<u64>().ok())
+            };
+
+            (path_val, len_val)
+        } else {
+            // No header: assume GFA-ish `node start end path`
+            let path_val = parts
+                .get(3)
+                .map(|s| s.to_string())
+                .or_else(|| parts.last().map(|s| s.to_string()));
+            let len_val = parts
+                .get(2)
+                .and_then(|s| s.parse::<u64>().ok())
+                .or_else(|| {
+                    parts
+                        .iter()
+                        .rev()
+                        .skip(1)
+                        .next()
+                        .and_then(|s| s.parse::<u64>().ok())
+                });
+            (path_val, len_val)
+        };
+
+        let path = match path_opt {
+            Some(pv) if !pv.is_empty() => pv,
+            _ => continue,
+        };
+        let len = len_opt.unwrap_or(0);
+
         contigs
             .entry(path)
-            .and_modify(|m| *m = (*m).max(end))
-            .or_insert(end);
+            .and_modify(|m| *m = (*m).max(len))
+            .or_insert(len);
     }
+
     Ok(contigs)
 }
 
