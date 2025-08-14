@@ -1,7 +1,11 @@
 mod extract;
 mod header;
 mod io_stream;
+mod nearest_main;
 mod sort_main;
+mod maf;
+
+use gfa_reader::Gfa;
 
 use clap::{Arg, Command};
 use std::collections::{HashMap, HashSet};
@@ -19,6 +23,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .arg(Arg::new("vcf").short('v').long("vcf").help("Input VCF file").required(true))
                 .arg(Arg::new("alignment").short('a').long("alignment").help("TSV file (alignment)").required(true))
                 .arg(Arg::new("reference").short('r').long("reference").help("reference.tsv for CHROM mapping/header synthesis; required unless --no-header. Supports 4- or 6-column TSV (last column always path); optionally uses third column start to set VCF POS during alignment.").num_args(1).required_unless_present("no-header"))
+                .arg(Arg::new("gfa").short('g').long("gfa").help("GFA file to source REF sequences; if provided, REF bases are taken from GFA and reference.tsv sequence is ignored").num_args(1))
                 .arg(Arg::new("skip").short('s').long("skip").help("Comma-separated substrings. A record is dropped if its raw #CHROM contains any of them.").num_args(1))
                 .arg(Arg::new("ignore").long("ignore").help("Ignore/normalize CHROM level [0-5] (applied after --skip): 0=keep, 1=has 'chr', 2=token [0-9XYM], 3=no suffix, 4=only chr{1..22,X,Y,M}, 5=only {1..22,X,Y,M}").num_args(1).default_value("4"))
                 .arg(Arg::new("output").short('o').long("output").help("Output VCF file path (default: <input>.replaced.vcf)"))
@@ -64,6 +69,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .arg(Arg::new("prefix").short('p').long("prefix").help("Column to sort by: keyword (CHROM, POS, ID, REF, ALT, QUAL, FILTER, INFO, FORMAT) or 0-based index (default: POS)").default_value("POS"))
                 .arg(Arg::new("reverse").long("reverse").help("Sort descending").action(clap::ArgAction::SetTrue))
                 .arg(Arg::new("output").short('o').long("output").help("Output VCF path (default: <input>.sorted.vcf)"))
+        )
+        .subcommand(
+            Command::new("nearest")
+                .about("Find the closest reference node for each node")
+                .arg(Arg::new("gfa").short('g').long("gfa").help("Input GFA file").required(true))
+                .arg(Arg::new("nodes").short('n').long("nodes").help("Optional file listing requested node IDs").num_args(1))
+                .arg(Arg::new("references").short('r').long("references").help("File listing reference path names").num_args(1).conflicts_with("prefix"))
+                .arg(Arg::new("prefix").short('p').long("prefix").help("Treat all paths with this prefix as references").num_args(1).conflicts_with("references"))
+                .arg(Arg::new("output").short('o').long("output").help("Output TSV path (default: <gfa_dir>/alignment.tsv)").required(false))
+                .arg(Arg::new("threads").short('t').long("threads").help("Worker threads for parsing GFA").default_value("1"))
+                .arg(Arg::new("keep-ref").long("keep-ref").help("Keep reference nodes in the output (distance = -1)").action(clap::ArgAction::SetTrue))
+        )
+        .subcommand(
+            Command::new("maf")
+                .about("Filter VCF by minor allele frequency threshold")
+                .arg(Arg::new("vcf")
+                    .short('v')
+                    .long("vcf")
+                    .help("VCF file to filter")
+                    .required(true))
+                .arg(Arg::new("thresh")
+                    .short('t')
+                    .long("thresh")
+                    .help("Threshold proportion for non-0/0 genotypes")
+                    .default_value("0.05"))
+                .arg(Arg::new("threads")
+                    .short('T')
+                    .long("threads")
+                    .help("Number of threads")
+                    .default_value("1"))
+                .arg(Arg::new("output")
+                    .short('o')
+                    .long("output")
+                    .help("Output VCF file path (default: <input>.filtered.vcf)"))
         );
     let matches = app.get_matches();
 
@@ -72,9 +111,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(("extract", sub_m)) => extract::extract_main(sub_m),
         Some(("header", sub_m)) => header::header_main(sub_m),
         Some(("sort", sub_m)) => sort_main::sort_main(sub_m),
+        Some(("nearest", sub_m)) => nearest_main::nearest_main(sub_m),
+        Some(("maf", sub_m)) => {
+            // Handle --output default: <input>.filtered.vcf
+            use std::path::Path;
+            // Get the input vcf path
+            let vcf_path = sub_m.get_one::<String>("vcf").expect("VCF file required");
+            // Check if output is present
+            let output_path = sub_m.get_one::<String>("output").cloned().unwrap_or_else(|| {
+                let p = Path::new(vcf_path);
+                let parent = p.parent().unwrap_or_else(|| Path::new("."));
+                let file_name = p.file_name().and_then(|s| s.to_str()).unwrap_or("output.vcf");
+                let filtered_name = if let Some(stripped) = file_name.strip_suffix(".vcf") {
+                    format!("{}.filtered.vcf", stripped)
+                } else {
+                    format!("{}.filtered.vcf", file_name)
+                };
+                parent.join(filtered_name).to_string_lossy().into_owned()
+            });
+            // Now, pass a new ArgMatches to maf_main with output set
+            // Since ArgMatches is not mutable, and maf_main expects &ArgMatches, we wrap output in a struct
+            // Instead, we call maf_main with the output_path as an extra argument
+            // But if maf::maf_main expects only ArgMatches, we can create a new ArgMatches with output inserted
+            // For now, call maf_main with sub_m, and let maf::maf_main get output from output_path
+            // So, pass sub_m, but maf_main should use output_path if needed
+            // Option 1: If maf_main expects only sub_m, we can add a method in maf_main to accept output_path
+            // Option 2: If maf_main expects sub_m, but reads output from sub_m, we can use a wrapper struct
+            // For now, call maf_main(sub_m, Some(output_path))
+            maf::maf_main(sub_m, &output_path)
+        }
         _ => {
             println!(
-                "Please choose a subcommand: align, extract, header, or sort. Use --help for details."
+                "Please choose a subcommand: align, extract, header, sort, or nearest. Use --help for details."
             );
             Ok(())
         }
@@ -86,6 +154,8 @@ fn align_main(matches: &clap::ArgMatches) -> Result<(), Box<dyn std::error::Erro
     let tsv_path = matches
         .get_one::<String>("alignment")
         .expect("--alignment/-a is required");
+
+    let gfa_path_opt: Option<&String> = matches.get_one::<String>("gfa");
 
     // helper: insert ".sorted" before trailing ".vcf"; if no .vcf, append ".sorted.vcf"
     fn with_sorted_suffix(p: &str) -> String {
@@ -187,7 +257,7 @@ fn align_main(matches: &clap::ArgMatches) -> Result<(), Box<dyn std::error::Erro
     println!("    --reverse  : {reverse}");
     println!("    --no-header: {}", no_header);
     println!(
-        "    #CHROM field will always be replaced by the corresponding path from TSV, or reference.tsv as fallback if provided."
+        "    #CHROM will be replaced by path (alignment.tsv prioritized). ID := original POS; POS := distance+position+1 when available; REF from GFA if provided, else reference.tsv."
     );
 
     let num_threads: Option<usize> = matches
@@ -201,6 +271,27 @@ fn align_main(matches: &clap::ArgMatches) -> Result<(), Box<dyn std::error::Erro
         println!("[info] Rayon thread pool set to {n} threads");
     }
 
+    let mut gfa_loaded: Option<Gfa<u32, (), ()>> = None;
+    if let Some(gfa_path) = gfa_path_opt {
+        let n_threads = num_threads.unwrap_or_else(|| rayon::current_num_threads());
+        println!(
+            "[info] Reading GFA and extracting path information... {}",
+            gfa_path
+        );
+        let mut g = Gfa::parse_gfa_file_multi(gfa_path, n_threads);
+        let converted_before = g.walk.len();
+        g.walk_to_path("#");
+        if converted_before > 0 {
+            println!(
+                "[info] Converted {} walks (W) into path entries",
+                converted_before
+            );
+        } else {
+            println!("[info] No walks (W) found to convert; proceeding with native P paths only");
+        }
+        gfa_loaded = Some(g);
+    }
+
     let skip_keywords_set: HashSet<String> = matches
         .get_one::<String>("skip")
         .map(|s| {
@@ -210,31 +301,41 @@ fn align_main(matches: &clap::ArgMatches) -> Result<(), Box<dyn std::error::Erro
                 .collect()
         })
         .unwrap_or_default();
-
-    let mut node2path: HashMap<u64, String> = HashMap::new();
+    let mut node2aln: HashMap<u64, io_stream::AlnInfo> = HashMap::new();
 
     if let Some(ref_path) = reference_path {
         println!("[info] Reading reference.tsv first: {ref_path}");
-        let ref_map = io_stream::read_reference_tsv(ref_path)?; // also seeds REF_NODE2* caches
+        let ref_map = io_stream::read_reference_tsv(ref_path)?; // seeds REF_NODE2* caches too
         let ref_count = ref_map.len();
-        node2path = ref_map;
-        println!("[info] reference.tsv loaded: {} node-paths", ref_count);
+        for (node, path) in ref_map.into_iter() {
+            node2aln.insert(
+                node,
+                io_stream::AlnInfo {
+                    path,
+                    distance: 0,
+                    position: 0,
+                },
+            );
+        }
+        println!(
+            "[info] reference.tsv loaded: {} node-paths (as AlnInfo)",
+            ref_count
+        );
     } else {
         println!("[info] No reference.tsv provided; will rely on alignment TSV for path mapping");
     }
 
-    println!("[info] Reading alignment TSV and adding missing node-paths: {tsv_path}");
-    let aln_map = io_stream::read_tsv_node_path(tsv_path)?;
-    let mut add_from_aln = 0usize;
-    for (node, path) in aln_map {
-        if !node2path.contains_key(&node) {
-            node2path.insert(node, path);
-            add_from_aln += 1;
-        }
+    println!("[info] Reading alignment TSV and merging: {tsv_path}");
+    let aln_map = io_stream::read_alignment_tsv(tsv_path)?;
+    let mut merged = 0usize;
+    for (node, a) in aln_map.into_iter() {
+        // alignment has priority for path + provides distance/position
+        node2aln.insert(node, a);
+        merged += 1;
     }
     println!(
-        "[info] alignment.tsv merged: {} new node-paths added (only for nodes missing in reference)",
-        add_from_aln
+        "[info] alignment.tsv loaded/merged: {} nodes (alignment takes priority)",
+        merged
     );
 
     // --- Streaming pass to temp file ---
@@ -246,9 +347,10 @@ fn align_main(matches: &clap::ArgMatches) -> Result<(), Box<dyn std::error::Erro
     let stats = io_stream::stream_replace_chrom_to_tmp(
         vcf_path,
         &tmp_out,
-        &node2path,
+        &node2aln,
         &skip_keywords_set,
         ignore_level,
+        gfa_loaded.as_ref(),
     )?;
     println!(
         "[info] Streaming complete: total={}, replaced={}, skipped={}, unmapped={}",

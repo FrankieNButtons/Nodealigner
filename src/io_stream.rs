@@ -2,71 +2,72 @@ use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::sync::OnceLock;
+use gfa_reader::Gfa;
 
 static REF_NODE2PATH: OnceLock<HashMap<u64, String>> = OnceLock::new();
 static REF_NODE2START: OnceLock<HashMap<u64, u64>> = OnceLock::new();
 static REF_NODE2SEQ: OnceLock<HashMap<u64, String>> = OnceLock::new();
 
-#[allow(dead_code)]
-pub struct VcfRecord {
-    pub chrom: String,
-    pub pos: u64,
-    pub rest: Vec<String>,
-    pub raw: String, // Full original line, for output
-}
+// #[allow(dead_code)]
+// pub struct VcfRecord {
+//     pub chrom: String,
+//     pub pos: u64,
+//     pub rest: Vec<String>,
+//     pub raw: String, // Full original line, for output
+// }
 
-/// Read VCF file, returning (header_lines, records)
-#[allow(dead_code)]
-pub fn read_vcf_records(
-    path: &str,
-) -> Result<(Vec<String>, Vec<VcfRecord>), Box<dyn std::error::Error>> {
-    let f = File::open(path)?;
-    let reader = BufReader::new(f);
+// /// Read VCF file, returning (header_lines, records)
+// #[allow(dead_code)]
+// pub fn read_vcf_records(
+//     path: &str,
+// ) -> Result<(Vec<String>, Vec<VcfRecord>), Box<dyn std::error::Error>> {
+//     let f = File::open(path)?;
+//     let reader = BufReader::new(f);
 
-    let mut headers = Vec::new();
-    let mut records = Vec::new();
+//     let mut headers = Vec::new();
+//     let mut records = Vec::new();
 
-    for line in reader.lines() {
-        let line = line?;
-        if line.starts_with('#') {
-            headers.push(line);
-        } else {
-            let fields: Vec<&str> = line.split('\t').collect();
-            if fields.len() < 2 {
-                continue;
-            }
-            let chrom = fields[0].to_string();
-            let pos: u64 = fields[1].parse().unwrap_or(0);
-            let rest = fields[2..].iter().map(|s| s.to_string()).collect();
-            records.push(VcfRecord {
-                chrom,
-                pos,
-                rest,
-                raw: line,
-            });
-        }
-    }
-    Ok((headers, records))
-}
+//     for line in reader.lines() {
+//         let line = line?;
+//         if line.starts_with('#') {
+//             headers.push(line);
+//         } else {
+//             let fields: Vec<&str> = line.split('\t').collect();
+//             if fields.len() < 2 {
+//                 continue;
+//             }
+//             let chrom = fields[0].to_string();
+//             let pos: u64 = fields[1].parse().unwrap_or(0);
+//             let rest = fields[2..].iter().map(|s| s.to_string()).collect();
+//             records.push(VcfRecord {
+//                 chrom,
+//                 pos,
+//                 rest,
+//                 raw: line,
+//             });
+//         }
+//     }
+//     Ok((headers, records))
+// }
 
-/// Write VCF file
-#[allow(dead_code)]
-pub fn write_vcf_records(
-    path: &str,
-    headers: &[String],
-    records: &[VcfRecord],
-) -> Result<(), Box<dyn std::error::Error>> {
-    let f = File::create(path)?;
-    let mut writer = BufWriter::new(f);
+// /// Write VCF file
+// #[allow(dead_code)]
+// pub fn write_vcf_records(
+//     path: &str,
+//     headers: &[String],
+//     records: &[VcfRecord],
+// ) -> Result<(), Box<dyn std::error::Error>> {
+//     let f = File::create(path)?;
+//     let mut writer = BufWriter::new(f);
 
-    for h in headers {
-        writeln!(writer, "{h}")?;
-    }
-    for rec in records {
-        writeln!(writer, "{}", rec.raw)?;
-    }
-    Ok(())
-}
+//     for h in headers {
+//         writeln!(writer, "{h}")?;
+//     }
+//     for rec in records {
+//         writeln!(writer, "{}", rec.raw)?;
+//     }
+//     Ok(())
+// }
 
 /// Streaming stats for VCF transform
 #[derive(Default, Debug)]
@@ -83,6 +84,13 @@ pub struct StreamStats {
     pub missing_seq: u64,
     pub used_ref_map: u64,
     pub used_aln_map: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct AlnInfo {
+    pub path: String,
+    pub distance: i64,
+    pub position: u64,
 }
 
 /// Return true if the raw CHROM field should be skipped entirely (substring match)
@@ -245,22 +253,24 @@ fn apply_ignore_rules(raw: &str, level: u8) -> Option<String> {
     }
 }
 
-/// Stream the input VCF and write a transformed, unsorted temp VCF.
-/// - Drop any record whose **raw CHROM** contains a `--skip` token (substring)
-/// - For remaining records, if CHROM parses to a node id and exists in mappings:
-///     - **Path** comes from `alignment.tsv` (`node2path` arg) with priority; if missing there, fall back to `reference.tsv` (global OnceLocks).
-///     - **Start/Seq** always come from `reference.tsv` (global OnceLocks).
-///   Otherwise keep CHROM as-is and count as `unmapped`.
-/// - Headers are passed through unchanged.
-///
-/// NOTE: Sorting is not performed here. The caller may run an external sort on the
-/// produced temp file. Headers are included at the top of the temp file.
+/// Replacement strategy (new):
+/// - 丢弃含有 `--skip` 关键词（子串匹配）的记录。
+/// - 解析 node_id：优先从 CHROM 提取纯数字；否则使用原始 POS 值。
+/// - 若能在 alignment.tsv 找到该 node：
+///     * CHROM := 规范化后的 path 名（按 ignore_level 过滤/归一化）。
+///     * ID    := 原始 POS 字符串（未替换前）。
+///     * POS   := distance + position + 1（alignment.tsv）。
+///     * REF   := 来自 GFA 的段序列；若未提供 GFA，则回退 reference.tsv 的 seq。
+/// - 若 alignment.tsv 缺失该 node：
+///     * 仍可用 reference.tsv 的 path/start/seq（若存在）进行回退；否则按 ignore 规则仅重写/保留 CHROM。
+/// - 若提供 GFA，则序列优先来自 GFA，且 reference.tsv 的序列将被忽略。
 pub fn stream_replace_chrom_to_tmp(
     vcf_path: &str,
     tmp_out_path: &str,
-    node2path: &HashMap<u64, String>,
+    node2aln: &HashMap<u64, AlnInfo>,
     skip: &HashSet<String>,
     ignore_level: u8, // 0..=5
+    gfa: Option<&Gfa<u32, (), ()>>, // 如果提供GFA，优先用其序列并可忽略reference.tsv
 ) -> Result<StreamStats, Box<dyn std::error::Error>> {
     let f_in = File::open(vcf_path)?;
     let reader = BufReader::new(f_in);
@@ -303,69 +313,88 @@ pub fn stream_replace_chrom_to_tmp(
         let mut wrote = false;
 
         if let Some(node_id) = node_id_opt {
-            // 路径优先来自 alignment.tsv，其次才使用 reference.tsv；start/seq 始终来自 reference.tsv
             let path_from_ref = REF_NODE2PATH.get().and_then(|m| m.get(&node_id));
-            let start_from_ref = REF_NODE2START.get().and_then(|m| m.get(&node_id)).copied();
             let seq_from_ref = REF_NODE2SEQ.get().and_then(|m| m.get(&node_id));
-            let path_from_aln = node2path.get(&node_id);
+            let aln_info = node2aln.get(&node_id);
 
-            // alignment.tsv 优先；若缺失则回退到 reference.tsv
-            let chosen_path = path_from_aln.or(path_from_ref);
-            let from_aln = path_from_aln.is_some();
-            let from_ref = !from_aln && path_from_ref.is_some();
+            // 选路径：alignment.tsv 优先；否则回退 reference.tsv
+            let chosen_path_opt: Option<&str> = aln_info
+                .map(|a| a.path.as_str())
+                .or(path_from_ref.map(|s| s.as_str()));
 
-            if let Some(path_val) = chosen_path {
+            if let Some(path_val) = chosen_path_opt {
                 if let Some(norm_chr) = apply_ignore_rules(path_val, ignore_level) {
-                    let mut out_fields: Vec<String> =
-                        fields.iter().map(|s| s.to_string()).collect();
+                    let mut out_fields: Vec<String> = fields.iter().map(|s| s.to_string()).collect();
 
-                    // 原始 POS
+                    // 保存原始 POS 到 ID（如果有第三列）
                     let orig_pos = out_fields.get(1).cloned().unwrap_or_default();
-                    if orig_pos == "1" {
-                        eprintln!(
-                            "[debug][vcf POS==1 orig] node_id={} path_from_ref={:?} start_from_ref={:?} seq_from_ref_len={:?}",
-                            node_id,
-                            path_from_ref,
-                            start_from_ref,
-                            seq_from_ref.as_ref().map(|s| s.len())
-                        );
-                    }
-
-                    // 1) CHROM
-                    out_fields[0] = norm_chr.clone();
-                    stats.replaced_chrom += 1;
-
-                    // 2) ID
                     if out_fields.len() >= 3 {
                         out_fields[2] = orig_pos.clone();
                         stats.replaced_id += 1;
                     }
+                    // 1) CHROM 由规范化的 path 名得到
+                    out_fields[0] = norm_chr.clone();
+                    stats.replaced_chrom += 1;
 
-                    // 3) REF
-                    if let Some(seq) = seq_from_ref {
-                        if out_fields.len() >= 4 {
-                            out_fields[3] = seq.to_string();
-                            stats.replaced_ref += 1;
+                    // 2) REF：优先从 GFA 取段序列；若无 GFA，则回退到 reference.tsv 的 seq
+                    let ref_set = false;
+                    if let Some(g) = gfa {
+                        let nid_u32 = node_id as u32;
+                        if nid_u32 as usize >= g.get_index_low() && nid_u32 as usize <= g.get_index_high() {
+                            let seq = g.get_sequence_by_id(&nid_u32);
+                            if out_fields.len() >= 4 {
+                                out_fields[3] = seq.to_string();
+                                stats.replaced_ref += 1;
+                            }
                         }
-                    } else {
-                        stats.missing_seq += 1;
+                    }
+                    if !ref_set {
+                        if let Some(seq) = seq_from_ref {
+                            if out_fields.len() >= 4 {
+                                out_fields[3] = seq.to_string();
+                                stats.replaced_ref += 1;
+                            }
+                        } else {
+                            stats.missing_seq += 1;
+                        }
                     }
 
-                    // 4) POS
-                    if let Some(start_val) = start_from_ref {
+                    // 3) POS：来自 alignment.tsv 的 distance + position + 1；若缺失则回退到原始 POS 或 reference start
+                    let mut pos_set = false;
+                    if let Some(a) = aln_info {
+                        // POS calculation rules:
+                        // - If distance is extremely large (> 1_000_000_000), use position directly.
+                        // - Otherwise, compute (distance + 1) as unsigned offset and add to position.
+                        //   Special case: distance == -1 => offset = 0 (same node), so POS = position.
+                        //   Any distance < -1 is clamped to behave like -1 to avoid u64 wrap.
+                        let new_pos: u64 = if a.distance > 1_000_000_000 {
+                            a.position
+                        } else {
+                            let offset = if a.distance >= -1 {
+                                (a.distance + 1) as u64
+                            } else {
+                                0u64
+                            };
+                            offset.saturating_add(a.position)
+                        };
                         if out_fields.len() >= 2 {
-                            out_fields[1] = start_val.to_string();
+                            out_fields[1] = new_pos.to_string();
                             stats.replaced_pos += 1;
+                            pos_set = true;
                         }
-                    } else {
-                        stats.missing_start += 1;
-                    }
-
-                    if from_aln {
                         stats.used_aln_map += 1;
-                    } else if from_ref {
-                        stats.used_ref_map += 1;
                     }
+                    if !pos_set {
+                        if let Some(start_val) = REF_NODE2START.get().and_then(|m| m.get(&node_id)).copied() {
+                            if out_fields.len() >= 2 {
+                                out_fields[1] = start_val.to_string();
+                                stats.replaced_pos += 1;
+                                pos_set = true;
+                            }
+                            stats.used_ref_map += 1;
+                        }
+                    }
+                    if !pos_set { stats.missing_start += 1; }
 
                     writeln!(writer, "{}", out_fields.join("\t"))?;
                     stats.replaced += 1;
@@ -416,34 +445,69 @@ pub fn stream_replace_chrom_to_tmp(
     Ok(stats)
 }
 
-/// 读取 alignment.tsv，建立 node->path（首行为表头自动跳过，首列node，末列path，自动trim）
-pub fn read_tsv_node_path(path: &str) -> Result<HashMap<u64, String>, Box<dyn std::error::Error>> {
+/// 读取 alignment.tsv（首行为表头或数据）。
+/// 需要列：node、path，以及可选列 distance、position；
+/// - 自动探测列名（不区分大小写）。
+/// - 若无表头，则按默认索引解析：node(0), distance(1), position(2), path(4)。
+pub fn read_alignment_tsv(path: &str) -> Result<HashMap<u64, AlnInfo>, Box<dyn std::error::Error>> {
     let f = File::open(path)?;
     let reader = BufReader::new(f);
-    let mut map = HashMap::new();
-    for (idx, line) in reader.lines().enumerate() {
+
+    let mut map: HashMap<u64, AlnInfo> = HashMap::new();
+
+    // Column indices (discovered from header if present)
+    let mut idx_node: Option<usize> = None;
+    let mut idx_path: Option<usize> = None;
+    let mut idx_distance: Option<usize> = None;
+    let mut idx_position: Option<usize> = None;
+
+    let mut header_seen = false;
+
+    for (_line_no, line) in reader.lines().enumerate() {
         let line = line?;
-        if idx == 0 || line.trim().is_empty() {
-            continue;
-        } // 跳过表头
-        let fields: Vec<&str> = line.split('\t').collect();
-        if fields.len() < 5 {
-            continue;
+        let trimmed = line.trim();
+        if trimmed.is_empty() { continue; }
+
+        let fields: Vec<&str> = trimmed.split('\t').collect();
+        // Detect header by typical tokens in the first non-empty line
+        if !header_seen {
+            let l0 = fields[0].to_ascii_lowercase();
+            if l0.contains("node") || l0.contains("id") {
+                header_seen = true;
+                for (i, col) in fields.iter().enumerate() {
+                    let c = col.to_ascii_lowercase();
+                    if idx_node.is_none() && (c == "node" || c == "id" || c == "segment" || c == "seg") { idx_node = Some(i); }
+                    if idx_path.is_none() && (c == "path" || c == "chrom" || c == "name") { idx_path = Some(i); }
+                    if idx_distance.is_none() && (c == "distance" || c == "dist" || c == "offset") { idx_distance = Some(i); }
+                    if idx_position.is_none() && (c == "position" || c == "pos") { idx_position = Some(i); }
+                }
+                // Fall through to next line for data
+                continue;
+            }
         }
-        // DEBUG: print the parsed fields when node is exactly "1"
-        if fields[0].trim() == "1" {
-            eprintln!(
-                "[debug][alignment node==1] idx={} fields_len={} fields={:?}",
-                idx,
-                fields.len(),
-                fields
-            );
-        }
-        let node: u64 = fields[0].trim().parse().unwrap_or(0);
-        let path = fields[4].trim().to_string();
-        map.insert(node, path);
+
+        // If we got here and we still don't have indices, assume default positional layout
+        let node_i = idx_node.unwrap_or(0);
+        let dist_i = idx_distance.unwrap_or(1);
+        let pos_i  = idx_position.unwrap_or(2);
+        let path_i = idx_path.unwrap_or_else(|| fields.len().saturating_sub(1).max(4));
+
+        if fields.len() <= node_i { continue; }
+        let node_raw = fields[node_i].trim();
+        if node_raw.is_empty() { continue; }
+        let node: u64 = match node_raw.parse() { Ok(v) => v, Err(_) => continue };
+
+        let mut info = AlnInfo::default();
+        // path
+        if fields.len() > path_i { info.path = fields[path_i].trim().to_string(); }
+        // distance
+        if fields.len() > dist_i { info.distance = fields[dist_i].trim().parse().unwrap_or(0); }
+        // position
+        if fields.len() > pos_i { info.position = fields[pos_i].trim().parse().unwrap_or(0); }
+
+        map.insert(node, info);
     }
-    // println!("[debug] node2path contains key 1? {}", map.contains_key(&1));
+
     Ok(map)
 }
 

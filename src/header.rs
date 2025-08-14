@@ -64,12 +64,25 @@ pub fn header_run(
     let (pre_header, column_header, blocks) = read_blocks_and_spool(reader, tmpw, block_cap)?;
 
     // Parallel inference
-    let (inferred_info, inferred_fmt, first_data) = infer_from_blocks_parallel(blocks);
+    let (inferred_info, inferred_fmt, first_data, contig_maxpos) = infer_from_blocks_parallel(blocks, ignore);
 
-    // Contigs
-    let contigs = parse_reference_tsv(reference_tsv)?;
-    if contigs.is_empty() {
-        eprintln!("[warn] reference.tsv produced no contigs; emitting header without lengths.");
+    // Optional: load contig lengths from reference.tsv, but we will emit contigs
+    // based **only** on what appears in the VCF body (after `ignore`).
+    let mut ref_len_map: BTreeMap<String, u64> = BTreeMap::new();
+    match parse_reference_tsv(reference_tsv) {
+        Ok(contigs_ref) => {
+            for (k, len) in contigs_ref {
+                if let Some(id) = apply_ignore_rules(&k, ignore) {
+                    let e = ref_len_map.entry(id).or_insert(0);
+                    if len > *e {
+                        *e = len;
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("[warn] reference.tsv not readable for contig lengths: {e}");
+        }
     }
 
     // Track existing INFO/FORMAT/FILTER
@@ -100,22 +113,16 @@ pub fn header_run(
     new_header.push(fileformat_line);
     new_header.push("##source=gfa2bin-aligner/header".to_string());
 
-    // Apply ignore rules and aggregate by normalized contig ID (max length per ID)
-    let mut norm_map: BTreeMap<String, u64> = BTreeMap::new();
-    for (k, len) in &contigs {
-        if let Some(id) = apply_ignore_rules(k, ignore) {
-            let entry = norm_map.entry(id).or_insert(0);
-            if *len > *entry {
-                *entry = *len;
+    // Emit contigs discovered from the VCF body (post-ignore). Use reference.tsv only for lengths.
+    println!("[info] Emitting contigs discovered from VCF body (ignore={ignore}). Seen {} contigs.", contig_maxpos.len());
+    for (id, _maxpos) in &contig_maxpos {
+        if let Some(len) = ref_len_map.get(id).copied() {
+            if len > 0 {
+                new_header.push(format!("##contig=<ID={},length={}>", id, len));
+                continue;
             }
         }
-    }
-    for (id, len) in norm_map.into_iter() {
-        if len > 0 {
-            new_header.push(format!("##contig=<ID={},length={}>", id, len));
-        } else {
-            new_header.push(format!("##contig=<ID={}>", id));
-        }
+        new_header.push(format!("##contig=<ID={}>", id));
     }
 
     for l in &pre_header {
@@ -534,10 +541,12 @@ fn read_blocks_and_spool<R: BufRead, W: Write>(
 
 fn infer_from_blocks_parallel(
     blocks: Vec<Block>,
+    ignore: u8,
 ) -> (
     BTreeMap<String, KeyStats>,
     BTreeMap<String, (ValKind, usize)>,
     Option<String>,
+    BTreeMap<String, u64>,
 ) {
     use rayon::prelude::*;
 
@@ -546,6 +555,7 @@ fn infer_from_blocks_parallel(
         .map(|blk| {
             let mut info_map: BTreeMap<String, KeyStats> = BTreeMap::new();
             let mut fmt_map: BTreeMap<String, (ValKind, usize)> = BTreeMap::new();
+            let mut contig_map: BTreeMap<String, u64> = BTreeMap::new();
             let mut first_data: Option<String> = None;
 
             for line in &blk.lines {
@@ -561,6 +571,19 @@ fn infer_from_blocks_parallel(
                 if fields.len() < 8 {
                     continue;
                 }
+
+                // Collect contigs from CHROM/POS after applying ignore rules
+                if let (Some(chrom_raw), Some(pos_str)) = (fields.get(0), fields.get(1)) {
+                    if let Ok(pos) = pos_str.parse::<u64>() {
+                        if let Some(chrom_id) = apply_ignore_rules(chrom_raw, ignore) {
+                            let e = contig_map.entry(chrom_id).or_insert(0);
+                            if pos > *e {
+                                *e = pos;
+                            }
+                        }
+                    }
+                }
+
                 let alt_ct = fields
                     .get(4)
                     .map(|alts| alts.split(',').filter(|x| !x.is_empty()).count())
@@ -615,18 +638,13 @@ fn infer_from_blocks_parallel(
                                 continue;
                             }
                             if let Some(sample) = fields.get(9) {
-                                if let Some((pos, _)) =
-                                    fmt.split(':').enumerate().find(|(_, k)| *k == key)
-                                {
+                                if let Some((pos, _)) = fmt.split(':').enumerate().find(|(_, k)| *k == key) {
                                     let sample_tok = sample.split(':').nth(pos).unwrap_or("");
-                                    let card =
-                                        sample_tok.split(',').filter(|x| !x.is_empty()).count();
+                                    let card = sample_tok.split(',').filter(|x| !x.is_empty()).count();
                                     let kind = if card == 0 {
                                         ValKind::Stringy
                                     } else {
-                                        classify_value_token(
-                                            sample_tok.split(',').next().unwrap_or(""),
-                                        )
+                                        classify_value_token(sample_tok.split(',').next().unwrap_or(""))
                                     };
                                     fmt_map.entry(key.to_string()).or_insert((kind, card));
                                 }
@@ -636,23 +654,30 @@ fn infer_from_blocks_parallel(
                 }
             }
 
-            (info_map, fmt_map, first_data)
+            (info_map, fmt_map, first_data, contig_map)
         })
         .collect::<Vec<_>>();
 
     let mut final_info: BTreeMap<String, KeyStats> = BTreeMap::new();
     let mut final_fmt: BTreeMap<String, (ValKind, usize)> = BTreeMap::new();
     let mut any_first: Option<String> = None;
+    let mut final_contigs: BTreeMap<String, u64> = BTreeMap::new();
 
-    for (im, fm, fd) in results {
+    for (im, fm, fd, cm) in results {
         final_info = merge_info_maps(final_info, im);
         final_fmt = merge_format_maps(final_fmt, fm);
         if any_first.is_none() {
             any_first = fd;
         }
+        for (k, v) in cm {
+            final_contigs
+                .entry(k)
+                .and_modify(|m| if v > *m { *m = v })
+                .or_insert(v);
+        }
     }
 
-    (final_info, final_fmt, any_first)
+    (final_info, final_fmt, any_first, final_contigs)
 }
 
 pub fn header_main(matches: &ArgMatches) -> Result<(), Box<dyn std::error::Error>> {
