@@ -2,15 +2,15 @@
 /// With the original version from `gfa2bin` (hhttps://github.com/MoinSebi/gfa2bin)
 use clap::ArgMatches;
 use gfa_reader::Gfa;
-use std::collections::{HashMap, HashSet};
 use log::info;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 
 use std::i64;
 use std::io::{self, BufWriter};
 use std::io::{BufRead, BufReader, Write};
-use std::str::FromStr;
 use std::path::Path;
+use std::str::FromStr;
 
 /// Nearest node main function
 ///
@@ -36,10 +36,38 @@ pub fn nearest_main(matches: &ArgMatches) -> Result<(), Box<dyn std::error::Erro
     println!("    --gfa      : {}", graph_file);
     println!("    --output   : {}", output_file);
     println!("    --threads  : {}", threads);
-    println!("    --nodes    : {}", if matches.contains_id("nodes") { matches.get_one::<String>("nodes").unwrap() } else { "All nodes" });
-    println!("    --references: {}", if matches.contains_id("references") { matches.get_one::<String>("references").unwrap() } else { "None" });
-    println!("    --prefix   : {}", if matches.contains_id("prefix") { matches.get_one::<String>("prefix").unwrap() } else { "None" });
-    println!("    --keep-ref : {}", if matches.contains_id("keep-ref") { "true" } else { "false" });
+    println!(
+        "    --nodes    : {}",
+        if matches.contains_id("nodes") {
+            matches.get_one::<String>("nodes").unwrap()
+        } else {
+            "All nodes"
+        }
+    );
+    println!(
+        "    --references: {}",
+        if matches.contains_id("references") {
+            matches.get_one::<String>("references").unwrap()
+        } else {
+            "None"
+        }
+    );
+    println!(
+        "    --prefix   : {}",
+        if matches.contains_id("prefix") {
+            matches.get_one::<String>("prefix").unwrap()
+        } else {
+            "None"
+        }
+    );
+    println!(
+        "    --keep-ref : {}",
+        if matches.contains_id("keep-ref") {
+            "true"
+        } else {
+            "false"
+        }
+    );
     println!(
         "    #CHROM will be replaced by path (alignment.tsv prioritized). ID := original POS; POS := distance+position+1 when available; REF from GFA if provided, else reference.tsv."
     );
@@ -72,7 +100,11 @@ pub fn nearest_main(matches: &ArgMatches) -> Result<(), Box<dyn std::error::Erro
     info!("Threads: {}", threads);
     info!(
         "Keep reference nodes: {}",
-        if matches.contains_id("keep-ref") { "true" } else { "false" }
+        if matches.contains_id("keep-ref") {
+            "true"
+        } else {
+            "false"
+        }
     );
     info!("Output file: {}\n", output_file);
 
@@ -101,7 +133,10 @@ pub fn nearest_main(matches: &ArgMatches) -> Result<(), Box<dyn std::error::Erro
     if matches.contains_id("references") {
         ref_list = read_input(matches.get_one::<String>("references").unwrap().as_str())?;
     } else if matches.contains_id("prefix") {
-        ref_list = by_prefix(matches.get_one::<String>("prefix").unwrap().as_str(), &graph)?;
+        ref_list = by_prefix(
+            matches.get_one::<String>("prefix").unwrap().as_str(),
+            &graph,
+        )?;
     } else {
         panic!("You need to provide either a reference list or a prefix")
     }
@@ -115,7 +150,10 @@ pub fn nearest_main(matches: &ArgMatches) -> Result<(), Box<dyn std::error::Erro
         &requested_nodes.iter().cloned().collect::<HashSet<u32>>(),
         keep_ref_nodes,
     );
-    info!("Number of closest node mappings: {}", closest_node_vec.len());
+    info!(
+        "Number of closest node mappings: {}",
+        closest_node_vec.len()
+    );
 
     info!("Writing output to {}", output_file);
     write_file(closest_node_vec, &output_file, &graph, &ref_list).unwrap();
@@ -165,7 +203,7 @@ pub fn read_input<T: FromStr>(input: &str) -> Result<Vec<T>, io::Error> {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "Failed to parse node (line)",
-                ))
+                ));
             }
         }
     }

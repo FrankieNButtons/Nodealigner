@@ -1,8 +1,8 @@
+use gfa_reader::Gfa;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::sync::OnceLock;
-use gfa_reader::Gfa;
 
 static REF_NODE2PATH: OnceLock<HashMap<u64, String>> = OnceLock::new();
 static REF_NODE2START: OnceLock<HashMap<u64, u64>> = OnceLock::new();
@@ -269,8 +269,9 @@ pub fn stream_replace_chrom_to_tmp(
     tmp_out_path: &str,
     node2aln: &HashMap<u64, AlnInfo>,
     skip: &HashSet<String>,
-    ignore_level: u8, // 0..=5
+    ignore_level: u8,               // 0..=5
     gfa: Option<&Gfa<u32, (), ()>>, // 如果提供GFA，优先用其序列并可忽略reference.tsv
+    oink: bool,
 ) -> Result<StreamStats, Box<dyn std::error::Error>> {
     let f_in = File::open(vcf_path)?;
     let reader = BufReader::new(f_in);
@@ -324,7 +325,8 @@ pub fn stream_replace_chrom_to_tmp(
 
             if let Some(path_val) = chosen_path_opt {
                 if let Some(norm_chr) = apply_ignore_rules(path_val, ignore_level) {
-                    let mut out_fields: Vec<String> = fields.iter().map(|s| s.to_string()).collect();
+                    let mut out_fields: Vec<String> =
+                        fields.iter().map(|s| s.to_string()).collect();
 
                     // 保存原始 POS 到 ID（如果有第三列）
                     let orig_pos = out_fields.get(1).cloned().unwrap_or_default();
@@ -340,7 +342,9 @@ pub fn stream_replace_chrom_to_tmp(
                     let ref_set = false;
                     if let Some(g) = gfa {
                         let nid_u32 = node_id as u32;
-                        if nid_u32 as usize >= g.get_index_low() && nid_u32 as usize <= g.get_index_high() {
+                        if nid_u32 as usize >= g.get_index_low()
+                            && nid_u32 as usize <= g.get_index_high()
+                        {
                             let seq = g.get_sequence_by_id(&nid_u32);
                             if out_fields.len() >= 4 {
                                 out_fields[3] = seq.to_string();
@@ -385,7 +389,9 @@ pub fn stream_replace_chrom_to_tmp(
                         stats.used_aln_map += 1;
                     }
                     if !pos_set {
-                        if let Some(start_val) = REF_NODE2START.get().and_then(|m| m.get(&node_id)).copied() {
+                        if let Some(start_val) =
+                            REF_NODE2START.get().and_then(|m| m.get(&node_id)).copied()
+                        {
                             if out_fields.len() >= 2 {
                                 out_fields[1] = start_val.to_string();
                                 stats.replaced_pos += 1;
@@ -394,7 +400,20 @@ pub fn stream_replace_chrom_to_tmp(
                             stats.used_ref_map += 1;
                         }
                     }
-                    if !pos_set { stats.missing_start += 1; }
+                    if !pos_set {
+                        stats.missing_start += 1;
+                    }
+
+                    // --oink: if this node is not on reference (distance != -1), set ALT to "oink"
+                    if oink {
+                        if let Some(a) = aln_info {
+                            if a.distance != -1 {
+                                if out_fields.len() > 4 {
+                                    out_fields[4] = "oink".to_string();
+                                }
+                            }
+                        }
+                    }
 
                     writeln!(writer, "{}", out_fields.join("\t"))?;
                     stats.replaced += 1;
@@ -466,7 +485,9 @@ pub fn read_alignment_tsv(path: &str) -> Result<HashMap<u64, AlnInfo>, Box<dyn s
     for (_line_no, line) in reader.lines().enumerate() {
         let line = line?;
         let trimmed = line.trim();
-        if trimmed.is_empty() { continue; }
+        if trimmed.is_empty() {
+            continue;
+        }
 
         let fields: Vec<&str> = trimmed.split('\t').collect();
         // Detect header by typical tokens in the first non-empty line
@@ -476,10 +497,20 @@ pub fn read_alignment_tsv(path: &str) -> Result<HashMap<u64, AlnInfo>, Box<dyn s
                 header_seen = true;
                 for (i, col) in fields.iter().enumerate() {
                     let c = col.to_ascii_lowercase();
-                    if idx_node.is_none() && (c == "node" || c == "id" || c == "segment" || c == "seg") { idx_node = Some(i); }
-                    if idx_path.is_none() && (c == "path" || c == "chrom" || c == "name") { idx_path = Some(i); }
-                    if idx_distance.is_none() && (c == "distance" || c == "dist" || c == "offset") { idx_distance = Some(i); }
-                    if idx_position.is_none() && (c == "position" || c == "pos") { idx_position = Some(i); }
+                    if idx_node.is_none()
+                        && (c == "node" || c == "id" || c == "segment" || c == "seg")
+                    {
+                        idx_node = Some(i);
+                    }
+                    if idx_path.is_none() && (c == "path" || c == "chrom" || c == "name") {
+                        idx_path = Some(i);
+                    }
+                    if idx_distance.is_none() && (c == "distance" || c == "dist" || c == "offset") {
+                        idx_distance = Some(i);
+                    }
+                    if idx_position.is_none() && (c == "position" || c == "pos") {
+                        idx_position = Some(i);
+                    }
                 }
                 // Fall through to next line for data
                 continue;
@@ -489,21 +520,34 @@ pub fn read_alignment_tsv(path: &str) -> Result<HashMap<u64, AlnInfo>, Box<dyn s
         // If we got here and we still don't have indices, assume default positional layout
         let node_i = idx_node.unwrap_or(0);
         let dist_i = idx_distance.unwrap_or(1);
-        let pos_i  = idx_position.unwrap_or(2);
+        let pos_i = idx_position.unwrap_or(2);
         let path_i = idx_path.unwrap_or_else(|| fields.len().saturating_sub(1).max(4));
 
-        if fields.len() <= node_i { continue; }
+        if fields.len() <= node_i {
+            continue;
+        }
         let node_raw = fields[node_i].trim();
-        if node_raw.is_empty() { continue; }
-        let node: u64 = match node_raw.parse() { Ok(v) => v, Err(_) => continue };
+        if node_raw.is_empty() {
+            continue;
+        }
+        let node: u64 = match node_raw.parse() {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
 
         let mut info = AlnInfo::default();
         // path
-        if fields.len() > path_i { info.path = fields[path_i].trim().to_string(); }
+        if fields.len() > path_i {
+            info.path = fields[path_i].trim().to_string();
+        }
         // distance
-        if fields.len() > dist_i { info.distance = fields[dist_i].trim().parse().unwrap_or(0); }
+        if fields.len() > dist_i {
+            info.distance = fields[dist_i].trim().parse().unwrap_or(0);
+        }
         // position
-        if fields.len() > pos_i { info.position = fields[pos_i].trim().parse().unwrap_or(0); }
+        if fields.len() > pos_i {
+            info.position = fields[pos_i].trim().parse().unwrap_or(0);
+        }
 
         map.insert(node, info);
     }

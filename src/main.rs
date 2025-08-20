@@ -1,9 +1,10 @@
 mod extract;
 mod header;
 mod io_stream;
+mod maf;
+mod name;
 mod nearest_main;
 mod sort_main;
-mod maf;
 
 use gfa_reader::Gfa;
 
@@ -32,6 +33,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .arg(Arg::new("reverse").long("reverse").help("Sort descending (big to small)").action(clap::ArgAction::SetTrue))
                 .arg(Arg::new("threads").short('T').long("threads").help("Number of threads for Rayon").num_args(1))
                 .arg(Arg::new("no-header").long("no-header").help("Do not synthesize a header on the combined VCF (by default, header is added using reference.tsv)").action(clap::ArgAction::SetTrue))
+                .arg(Arg::new("oink").short('k').long("oink").help("Oink the node if it is not on reference").action(clap::ArgAction::SetTrue))
         )
         .subcommand(
             Command::new("extract")
@@ -79,7 +81,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .arg(Arg::new("prefix").short('p').long("prefix").help("Treat all paths with this prefix as references").num_args(1).conflicts_with("references"))
                 .arg(Arg::new("output").short('o').long("output").help("Output TSV path (default: <gfa_dir>/alignment.tsv)").required(false))
                 .arg(Arg::new("threads").short('t').long("threads").help("Worker threads for parsing GFA").default_value("1"))
-                .arg(Arg::new("keep-ref").long("keep-ref").help("Keep reference nodes in the output (distance = -1)").action(clap::ArgAction::SetTrue))
+                .arg(Arg::new("keep-ref").long("keep-ref").help("Keep reference nodes in the output (distance = -1)").action(clap::ArgAction::SetFalse))
         )
         .subcommand(
             Command::new("maf")
@@ -103,6 +105,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .short('o')
                     .long("output")
                     .help("Output VCF file path (default: <input>.filtered.vcf)"))
+        )
+        .subcommand(
+            Command::new("rename")
+                .about("Rename QTL TSV file using VCF variant information")
+                .arg(Arg::new("vcf")
+                    .short('v')
+                    .long("vcf")
+                    .help("Input VCF file with variant information")
+                    .required(true))
+                .arg(Arg::new("qtl")
+                    .short('q')
+                    .long("qtl")
+                    .help("Input QTL TSV file to be renamed")
+                    .required(true))
+                .arg(Arg::new("threads")
+                    .short('T')
+                    .long("threads")
+                    .help("Number of threads for processing")
+                    .default_value("1"))
+                .arg(Arg::new("output")
+                    .short('o')
+                    .long("output")
+                    .help("Output TSV file path (default: <qtl_dir>/qtl.renamed.tsv)"))
         );
     let matches = app.get_matches();
 
@@ -118,17 +143,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Get the input vcf path
             let vcf_path = sub_m.get_one::<String>("vcf").expect("VCF file required");
             // Check if output is present
-            let output_path = sub_m.get_one::<String>("output").cloned().unwrap_or_else(|| {
-                let p = Path::new(vcf_path);
-                let parent = p.parent().unwrap_or_else(|| Path::new("."));
-                let file_name = p.file_name().and_then(|s| s.to_str()).unwrap_or("output.vcf");
-                let filtered_name = if let Some(stripped) = file_name.strip_suffix(".vcf") {
-                    format!("{}.filtered.vcf", stripped)
-                } else {
-                    format!("{}.filtered.vcf", file_name)
-                };
-                parent.join(filtered_name).to_string_lossy().into_owned()
-            });
+            let output_path = sub_m
+                .get_one::<String>("output")
+                .cloned()
+                .unwrap_or_else(|| {
+                    let p = Path::new(vcf_path);
+                    let parent = p.parent().unwrap_or_else(|| Path::new("."));
+                    let file_name = p
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("output.vcf");
+                    let filtered_name = if let Some(stripped) = file_name.strip_suffix(".vcf") {
+                        format!("{}.filtered.vcf", stripped)
+                    } else {
+                        format!("{}.filtered.vcf", file_name)
+                    };
+                    parent.join(filtered_name).to_string_lossy().into_owned()
+                });
             // Now, pass a new ArgMatches to maf_main with output set
             // Since ArgMatches is not mutable, and maf_main expects &ArgMatches, we wrap output in a struct
             // Instead, we call maf_main with the output_path as an extra argument
@@ -139,6 +170,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Option 2: If maf_main expects sub_m, but reads output from sub_m, we can use a wrapper struct
             // For now, call maf_main(sub_m, Some(output_path))
             maf::maf_main(sub_m, &output_path)
+        }
+        Some(("rename", sub_m)) => {
+            let vcf_path = sub_m.get_one::<String>("vcf").expect("VCF file required");
+            let qtl_path = sub_m.get_one::<String>("qtl").expect("QTL file required");
+
+            // Handle --output default: <qtl_dir>/qtl.renamed.tsv
+            let output_path = sub_m
+                .get_one::<String>("output")
+                .cloned()
+                .unwrap_or_else(|| {
+                    if let Some(stripped) = qtl_path.strip_suffix(".tsv") {
+                        format!("{}.renamed.tsv", stripped)
+                    } else {
+                        format!("{}.renamed.tsv", qtl_path)
+                    }
+                });
+
+            let threads: usize = sub_m
+                .get_one::<String>("threads")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(1);
+
+            println!("[info] [rename] Running with arguments:");
+            println!("    --vcf   : {}", vcf_path);
+            println!("    --qtl   : {}", qtl_path);
+            println!("    --output: {}", output_path);
+            println!("    --threads: {}", threads);
+
+            name::run_rename(vcf_path, qtl_path, threads)
         }
         _ => {
             println!(
@@ -233,6 +293,7 @@ fn align_main(matches: &clap::ArgMatches) -> Result<(), Box<dyn std::error::Erro
         .unwrap_or_else(|| "POS".to_string());
     let reverse = matches.get_flag("reverse");
     let no_header = matches.get_flag("no-header");
+    let oink = matches.get_flag("oink");
 
     // Note: we will later pull `start` for POS replacement and swap POS→ID in io_stream
     let reference_path = matches.get_one::<String>("reference").map(|s| s.as_str());
@@ -256,6 +317,7 @@ fn align_main(matches: &clap::ArgMatches) -> Result<(), Box<dyn std::error::Erro
     println!("    --prefix   : {prefix_key}");
     println!("    --reverse  : {reverse}");
     println!("    --no-header: {}", no_header);
+    println!("    --oink     : {}", oink);
     println!(
         "    #CHROM will be replaced by path (alignment.tsv prioritized). ID := original POS; POS := distance+position+1 when available; REF from GFA if provided, else reference.tsv."
     );
@@ -351,6 +413,7 @@ fn align_main(matches: &clap::ArgMatches) -> Result<(), Box<dyn std::error::Erro
         &skip_keywords_set,
         ignore_level,
         gfa_loaded.as_ref(),
+        oink,
     )?;
     println!(
         "[info] Streaming complete: total={}, replaced={}, skipped={}, unmapped={}",
