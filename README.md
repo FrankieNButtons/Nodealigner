@@ -9,6 +9,11 @@
 - **Header:** Build a valid VCF header based on keys inferred from a VCF-like file and path data from `reference.tsv`.
 - **Sort:** Order VCF records by an arbitrary column (e.g. `POS`, `CHROM`, or an index).
 
+## New in v0.0.3
+
+- **Header subcommand:** newly added to reconstruct contig and FORMAT lines so that tools like `bcftools` accept the output without complaints.
+- **Streaming alignment pipeline:** `align` can now filter unwanted chromosomes (`--skip`), normalize names (`--ignore`), optionally sort records and synthesize a header automatically unless `--no-header` is supplied.
+
 ## Installation
 
 This repository is a Cargo project. To build the current release (version `0.0.3`) from source:
@@ -81,4 +86,12 @@ Sorts a VCF by a named field or numeric index. Use `--reverse` for descending or
 - Provide a comma-separated list of contigs with `--skip` to drop unwanted chromosomes like `chrM` or scaffolds.
 - Large datasets benefit from `--threads` to utilize all available CPU cores.
 - After sorting, the tool inserts `.sorted` before the `.vcf` extension to prevent overwriting the unsorted output.
+
+
+## TODO
+
+- Handle gzipped VCF and TSV files directly.
+- Expose the streaming combine pipeline as a dedicated subcommand.
+- Publish pre-built binaries for common platforms.
+- Add integration tests for typical end-to-end workflows.
 
