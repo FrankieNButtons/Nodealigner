@@ -87,6 +87,7 @@ Sorts a VCF by a named field or numeric index. Use `--reverse` for descending or
 - Large datasets benefit from `--threads` to utilize all available CPU cores.
 - After sorting, the tool inserts `.sorted` before the `.vcf` extension to prevent overwriting the unsorted output.
 
+
 ## TODO
 
 - Handle gzipped VCF and TSV files directly.
