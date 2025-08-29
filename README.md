@@ -1,6 +1,6 @@
-# gfa2bin-aligner
+# NodeAligner
 
-`gfa2bin-aligner` is a command line toolkit for working with variation graphs and VCF files. It extends the [`gfa2bin`](https://github.com/MoinSebi/gfa2bin) utilities with features for aligning VCF files to graph paths, extracting path information, synthesizing VCF headers and sorting variant records. The goal is to make it easy to convert coordinates from a VCF into graph path names and back again while keeping standard VCF tooling compatible.
+`NodeAligner` is a command line toolkit for working with variation graphs and VCF files. It extends the [`gfa2bin`](https://github.com/MoinSebi/gfa2bin) utilities with features for aligning VCF files to graph paths, extracting path information, synthesizing VCF headers and sorting variant records. The goal is to make it easy to convert coordinates from a VCF into graph path names and back again while keeping standard VCF tooling compatible.
 
 ## Features
 
